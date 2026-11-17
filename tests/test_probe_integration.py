@@ -242,6 +242,283 @@ class TestProbeCore:
         assert "上限" in hops[-1].reject_reason
 
 
+class TestResponseFraming:
+    """HTTP/1.1 响应完整性判定（保活、断流、分块、长度冲突）。"""
+
+    async def test_keepalive_get_completes_without_waiting_for_close(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # 完整响应（Content-Length 正确）后连接保持：应立即完成，不等读取超时
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            keep_open=True,
+        )
+        fake_dns.set_zones({"ka.test": ["127.0.0.1"]})
+        prober = make_prober(read_timeout=5.0)
+
+        started = asyncio.get_running_loop().time()
+        hops = await prober.probe(f"http://ka.test:{port}/")
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert hops[-1].outcome == "ok"
+        assert hops[-1].status_code == 200
+        assert elapsed < 2.0  # 远小于 read_timeout=5s
+
+    async def test_keepalive_redirect_followed_promptly(
+        self, fake_dns, http_server, raw_server, make_prober
+    ):
+        # 保活目标返回 302：响应完整即应进行跳转检查，不被未关闭的连接拖延
+        fake_dns.set_zones({
+            "start.test": ["127.0.0.1"],
+            "final.test": ["127.0.0.1"],
+        })
+        http_server.route("final.test", "/done")
+        port = await raw_server(
+            (
+                "HTTP/1.1 302 Found\r\n"
+                f"Location: http://final.test:{http_server.port}/done\r\n"
+                "Content-Length: 0\r\n\r\n"
+            ).encode(),
+            keep_open=True,
+        )
+        prober = make_prober(read_timeout=5.0)
+
+        started = asyncio.get_running_loop().time()
+        hops = await prober.probe(f"http://start.test:{port}/go")
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert [h.outcome for h in hops] == ["redirected", "ok"]
+        assert hops[1].status_code == 200
+        assert elapsed < 2.0
+
+    async def test_truncated_fixed_body_is_error_not_ok(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # 声明 Content-Length 100 但只发 5 字节就断开：不得报可达
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort",
+        )
+        fake_dns.set_zones({"cut.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://cut.test:{port}/")
+
+        assert hops[-1].outcome == "error"
+        assert "不完整" in (hops[-1].error or "")
+
+    async def test_truncated_redirect_is_not_followed(
+        self, fake_dns, http_server, raw_server, make_prober
+    ):
+        # 302 声明了正文但未收齐即断开：不得报可达，也不得继续跳转
+        fake_dns.set_zones({
+            "start.test": ["127.0.0.1"],
+            "final.test": ["127.0.0.1"],
+        })
+        http_server.route("final.test", "/done")
+        port = await raw_server(
+            (
+                "HTTP/1.1 302 Found\r\n"
+                f"Location: http://final.test:{http_server.port}/done\r\n"
+                "Content-Length: 64\r\n\r\npartial"
+            ).encode(),
+        )
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://start.test:{port}/go")
+
+        assert len(hops) == 1
+        assert hops[0].outcome == "error"
+        assert "不完整" in (hops[0].error or "")
+        assert len(http_server.requests) == 0  # 未跟随跳转
+
+    async def test_chunked_body_ok_despite_keepalive(
+        self, fake_dns, raw_server, make_prober
+    ):
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+            keep_open=True,
+        )
+        fake_dns.set_zones({"ch.test": ["127.0.0.1"]})
+        prober = make_prober(read_timeout=5.0)
+
+        started = asyncio.get_running_loop().time()
+        hops = await prober.probe(f"http://ch.test:{port}/")
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert hops[-1].outcome == "ok"
+        assert elapsed < 2.0
+
+    async def test_chunked_bad_size_is_error(
+        self, fake_dns, raw_server, make_prober
+    ):
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"ZZZ\r\nhello\r\n",
+        )
+        fake_dns.set_zones({"bad-ch.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://bad-ch.test:{port}/")
+
+        assert hops[-1].outcome == "error"
+        assert "分块" in (hops[-1].error or "")
+
+    async def test_chunked_cut_mid_data_is_error(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # 块声明 5 字节，只收到 2 字节连接就关闭
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe",
+        )
+        fake_dns.set_zones({"cut-ch.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://cut-ch.test:{port}/")
+
+        assert hops[-1].outcome == "error"
+        assert "分块" in (hops[-1].error or "")
+
+    async def test_conflicting_length_headers_is_error(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # Content-Length 与 Transfer-Encoding 并存：长度信息冲突
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        fake_dns.set_zones({"cf.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://cf.test:{port}/")
+
+        assert hops[-1].outcome == "error"
+        assert "冲突" in (hops[-1].error or "")
+
+    async def test_non_chunked_te_with_content_length_is_error(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # 非 chunked 的 Transfer-Encoding 与 Content-Length 并存同样是冲突
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+            b"Transfer-Encoding: gzip\r\n\r\nhello",
+        )
+        fake_dns.set_zones({"cf2.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://cf2.test:{port}/")
+
+        assert hops[-1].outcome == "error"
+        assert "冲突" in (hops[-1].error or "")
+
+    async def test_mismatched_duplicate_content_length_is_error(
+        self, fake_dns, raw_server, make_prober
+    ):
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
+        )
+        fake_dns.set_zones({"dup.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://dup.test:{port}/")
+
+        assert hops[-1].outcome == "error"
+        assert "冲突" in (hops[-1].error or "")
+
+    async def test_duplicate_equal_content_length_ok(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # 等值重复的 Content-Length 合法（RFC 9110 允许）
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            keep_open=True,
+        )
+        fake_dns.set_zones({"eq.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://eq.test:{port}/")
+
+        assert hops[-1].outcome == "ok"
+
+    async def test_head_response_ends_after_headers(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # HEAD：服务器只发响应头（声明了 Content-Length）且保持连接
+        port = await raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            keep_open=True,
+        )
+        fake_dns.set_zones({"head.test": ["127.0.0.1"]})
+        prober = make_prober(read_timeout=5.0)
+
+        started = asyncio.get_running_loop().time()
+        hops = await prober.probe(f"http://head.test:{port}/", method="HEAD")
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert hops[-1].outcome == "ok"
+        assert hops[-1].status_code == 200
+        assert elapsed < 2.0
+
+    async def test_204_response_ends_after_headers(
+        self, fake_dns, raw_server, make_prober
+    ):
+        port = await raw_server(b"HTTP/1.1 204 No Content\r\n\r\n", keep_open=True)
+        fake_dns.set_zones({"nc.test": ["127.0.0.1"]})
+        prober = make_prober(read_timeout=5.0)
+
+        started = asyncio.get_running_loop().time()
+        hops = await prober.probe(f"http://nc.test:{port}/")
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert hops[-1].outcome == "ok"
+        assert hops[-1].status_code == 204
+        assert elapsed < 2.0
+
+    async def test_304_response_ends_after_headers(
+        self, fake_dns, raw_server, make_prober
+    ):
+        port = await raw_server(b"HTTP/1.1 304 Not Modified\r\n\r\n", keep_open=True)
+        fake_dns.set_zones({"nm.test": ["127.0.0.1"]})
+        prober = make_prober(read_timeout=5.0)
+
+        started = asyncio.get_running_loop().time()
+        hops = await prober.probe(f"http://nm.test:{port}/")
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert hops[-1].outcome == "ok"
+        assert hops[-1].status_code == 304
+        assert elapsed < 2.0
+
+    async def test_no_length_body_delimited_by_close(
+        self, fake_dns, raw_server, make_prober
+    ):
+        # 无长度信息：正文以连接关闭为界（原有行为保持）
+        port = await raw_server(b"HTTP/1.1 200 OK\r\n\r\nbody-bytes")
+        fake_dns.set_zones({"nl.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://nl.test:{port}/")
+
+        assert hops[-1].outcome == "ok"
+        assert hops[-1].status_code == 200
+
+    async def test_interim_100_response_then_final(
+        self, fake_dns, raw_server, make_prober
+    ):
+        port = await raw_server(
+            b"HTTP/1.1 100 Continue\r\n\r\n"
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            keep_open=True,
+        )
+        fake_dns.set_zones({"ic.test": ["127.0.0.1"]})
+        prober = make_prober()
+
+        hops = await prober.probe(f"http://ic.test:{port}/")
+
+        assert hops[-1].outcome == "ok"
+        assert hops[-1].status_code == 200
+
+
 class TestTls:
     async def test_https_verified_with_original_hostname(
         self, fake_dns, https_server, make_prober

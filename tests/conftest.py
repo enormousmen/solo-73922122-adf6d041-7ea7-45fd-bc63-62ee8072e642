@@ -163,6 +163,52 @@ async def http_server() -> FakeHttpServer:
 
 
 @pytest_asyncio.fixture()
+async def raw_server():
+    """原始可控 HTTP 服务器工厂：预置响应字节与连接行为。
+
+    用法：``port = await raw_server(b"HTTP/1.1 200 OK\\r\\n...", keep_open=True)``
+    ``keep_open=True`` 时发送响应后保持连接（等客户端关闭或超时），
+    模拟“发完响应不关闭”的保活目标。
+    """
+    servers: list[asyncio.base_events.Server] = []
+
+    async def _start(response: bytes, keep_open: bool = False,
+                     keep_open_for: float = 30.0) -> int:
+        async def handle(reader, writer):  # noqa: ANN001
+            try:
+                while True:
+                    line = await reader.readline()
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+                writer.write(response)
+                await writer.drain()
+                if keep_open:
+                    try:
+                        await asyncio.wait_for(reader.read(), timeout=keep_open_for)
+                    except asyncio.TimeoutError:
+                        pass
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+
+        srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+        servers.append(srv)
+        return srv.sockets[0].getsockname()[1]
+
+    try:
+        yield _start
+    finally:
+        for srv in servers:
+            srv.close()
+            await srv.wait_closed()
+
+
+@pytest_asyncio.fixture()
 async def https_server(demo_certs) -> FakeHttpServer:
     certfile, keyfile, _cafile = demo_certs
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

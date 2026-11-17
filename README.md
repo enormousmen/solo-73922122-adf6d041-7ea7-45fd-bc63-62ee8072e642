@@ -15,9 +15,16 @@ URL 静态校验（不产生流量）
              └─ 全部获准才连接；任一地址在禁区 → 整体拒绝（不返回部分结果）
                   └─ 仅向“检查时已批准的 IP”建 TCP，运行时不再解析 DNS
                        └─ HTTPS 用原域名做 SNI 并验证证书（不可关闭校验）
-                            └─ 发送一次请求、读取响应
+                            └─ 发送一次请求、按 HTTP/1.1 边界读取完整响应
                                  └─ 3xx 跳转：对 Location 重复整套流程（最多 3 次）
 ```
+
+响应完整性判定（GET）：按 `Content-Length` 收齐正文、按分块编码读到终止块、
+无长度信息时以连接关闭为界；HEAD 及 204/304 响应在完整响应头后即结束。
+完整响应即使对端保持连接（keep-alive）也立即给出状态并进行跳转检查；
+正文不全、分块格式错误或长度信息冲突（`Content-Length` 与
+`Transfer-Encoding` 并存、多个 `Content-Length` 值不一致）一律判错，
+不报可达也不继续跳转。
 
 由此满足：
 
@@ -47,11 +54,12 @@ app/
     config.py       环境变量配置（启动时校验）
     main.py         FastAPI 应用（/api/v1/probe、/docs）
   dns_service/      本地可切换解析的 DNS（UDP/53 + HTTP 控制面 profile 热切换）
-  targets/          演示目标（HTTP/8080、HTTPS/8443，含各类跳转与访问记录）
+  targets/          演示目标（HTTP/8080、HTTPS/8443，含各类跳转与访问记录；
+                    8090 为原始可控目标：保活/断流/分块/长度冲突）
   certinit/         生成演示 CA、服务器证书、合并 CA bundle
 dns-profiles/       DNS 场景：allowed / swapped / mixed / loop
 compose.yaml        一键启动的完整演示环境
-tests/              57 个测试（策略、DNS 协议、TLS、跳转、并发、API 全链路）
+tests/              75 个测试（策略、DNS 协议、TLS、跳转、响应完整性、并发、API 全链路）
 scripts/demo.sh     演示脚本
 ```
 
@@ -74,6 +82,23 @@ open http://127.0.0.1:8000/docs
 目标服务同时监听标准端口 `80/443`（供跳转 URL 直接使用）与演示端口
 `8080/8443`，HTTP 与 HTTPS 行为一致；可用环境变量
 `TARGET_HTTP_PORTS` / `TARGET_HTTPS_PORTS` 覆盖监听端口。
+另有原始可控目标端口 `8090`（`TARGET_RAW_PORT` 可覆盖），逐字节控制
+响应与连接行为，用于演示响应完整性判定：
+
+| 路径 | 行为 |
+| --- | --- |
+| `/keepalive` | 完整响应（`Content-Length` 正确）后保持连接不关闭 |
+| `/keepalive-redirect` | 302 + `Content-Length: 0` 后保持连接 |
+| `/truncated` | 声明长度大于实际发送，随后立即断开 |
+| `/stalled` | 声明长度大于实际发送，随后保持连接（挂起，演示读取超时） |
+| `/chunked` | 正常分块响应，终止块后保持连接 |
+| `/chunked-bad` | 非法块大小（分块格式错误） |
+| `/conflict` | 同时携带 `Content-Length` 与 `Transfer-Encoding` |
+| `/no-length` | 无长度头，正文以连接关闭为界 |
+| `/status/204`、`/status/304` | 无正文响应，响应头后保持连接 |
+
+以上端点在 compose 内通过 `http://raw.demo.test:8090/...` 访问；
+`target-allowed` 的 `8080/8090` 端口仅映射到本机回环，便于直接验证。
 
 > probe 容器**同时接入** `net_denied`（路由层可达），但白名单不含该网段。
 > 这证明拦截来自应用层白名单策略，而不是网络隔离。
@@ -170,13 +195,15 @@ pip install -r requirements.txt pytest pytest-asyncio
 pytest -q
 ```
 
-57 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
+75 个测试覆盖：CIDR/URL 策略、DNS 编解码与压缩指针环路、全链路探测、
 混合解析整体拒绝、检查后换址、跳转上限/跳禁区/非 HTTP 协议、HTTPS 证书
-主机名校验与不受信证书拒绝、慢探测并发非阻塞、429 保护、API 层。
+主机名校验与不受信证书拒绝、响应完整性（保活及时完成、断流判错、分块、
+长度冲突、HEAD/204/304 无正文）、慢探测并发非阻塞、429 保护、API 层。
 
 ## 设计边界与说明
 
-- 探测只实现 GET/HEAD、HTTP/1.1，读取响应体有 64KB 上限，仅用于连通性判断；
+- 探测只实现 GET/HEAD、HTTP/1.1；响应头与正文各有 64KB 读取上限，
+  仅用于连通性判断；正文完整性按上述规则严格判定，不完整即报错；
 - 不跟随 cookie、不发送请求体、不执行任何页面脚本；
 - DNS 仅做 A 记录查询（AAAA 不存在即天然 IPv4-only）；
 - 演示 CA 与证书仅用于本地/compose 演示，生产环境应使用真实 PKI 并通过

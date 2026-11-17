@@ -54,7 +54,7 @@ services:
       certinit:
         condition: service_completed_successfully
 
-  # 允许访问的目标：HTTP/8080 + HTTPS/8443
+  # 允许访问的目标：HTTP/8080 + HTTPS/8443 + 原始可控目标 8090（保活/断流演示）
   target-allowed:
     build: .
     command: ["python", "-m", "app.targets.server"]
@@ -62,6 +62,10 @@ services:
       CERT_DIR: /app/certs
     volumes:
       - certs:/app/certs:ro
+    ports:
+      # 仅绑定本机回环：便于查看访问记录（/_requests）与直接验证保活/断流行为
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8090:8090"
     networks:
       net_allowed:
         ipv4_address: 172.31.10.10

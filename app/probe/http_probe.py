@@ -161,8 +161,9 @@ class Prober:
                         hop, reader, writer, method, host, hop.port, url
                     )
                 except PolicyError as exc:
-                    # 响应阶段的策略性错误（如响应头超限、非法状态行）：
-                    # 记录为本跳错误，不逃逸到 API 入口
+                    # 响应阶段的策略性错误（响应头超限、非法状态行、正文不完整、
+                    # 分块格式错误、长度信息冲突等）：记录为本跳错误，
+                    # 不逃逸到 API 入口，也绝不继续跳转
                     hop.mark_error(str(exc))
                     return None
                 finally:
@@ -221,7 +222,7 @@ class Prober:
             await writer.drain()
             hop.request_sent = True
             response = await asyncio.wait_for(
-                self._read_response(reader), timeout=self._read_timeout
+                self._read_response(reader, method), timeout=self._read_timeout
             )
         except asyncio.TimeoutError as exc:
             hop.mark_error(f"读取响应超时（{self._read_timeout}s）")
@@ -248,19 +249,77 @@ class Prober:
             return next_url
         return None
 
-    async def _read_response(self, reader) -> dict:
-        # 逐字节读到头部结束（慢服务器一次只发几个字节也能正确处理）；
-        # body 在 Connection: close 下读到对端关闭即可，
-        # 但为保护自身只读取上限字节，超出即截断。
-        header_blob = b""
-        while b"\r\n\r\n" not in header_blob:
-            chunk = await reader.read(1)
-            if not chunk:
-                break
-            header_blob += chunk
-            if len(header_blob) > self._max_bytes:
+    async def _read_response(self, reader, method: str) -> dict:
+        """读取一个 *完整* 的 HTTP/1.1 响应；不完整或自相矛盾即抛 PolicyError。
+
+        报文完整性判定（RFC 9112 消息边界）：
+        * HEAD 响应及 204/304 状态码：完整响应头即为完整响应，不读正文；
+        * ``Transfer-Encoding`` 最终编码为 chunked：必须读到终止块（0 长度
+          块）及其后的 trailer 结束行，块格式错误即判错；
+        * ``Content-Length: N``：必须收齐 N 字节正文，连接在收齐前关闭
+          即“正文不完整”（超过 64KiB 上限的部分按上限截断，不再读取）；
+        * 无长度信息：正文以连接关闭为界，读到 EOF 为止；
+        * ``Content-Length`` 与 ``Transfer-Encoding`` 并存、或多个
+          ``Content-Length`` 值不一致：长度信息冲突，直接判错。
+
+        完整响应即使对端保持连接（keep-alive）也立即返回，不等连接关闭，
+        因此跳转检查不会被慢关闭的连接拖延。
+        """
+        interim = 0
+        while True:
+            head = await self._read_head_block(reader)
+            status, reason, headers, content_length, chunked, has_te = (
+                self._parse_head(head)
+            )
+            if 100 <= status < 200:
+                # 1xx 临时响应（如 100 Continue）：无正文，继续读最终响应
+                interim += 1
+                if interim > 8:
+                    raise PolicyError("服务器连续返回过多 1xx 临时响应")
+                continue
+            break
+
+        if content_length is not None and has_te:
+            raise PolicyError(
+                "响应长度信息冲突: 同时携带 Content-Length 与 Transfer-Encoding"
+            )
+        has_body = method != "HEAD" and status not in (204, 304)
+        if has_body:
+            if chunked:
+                await self._read_chunked_body(reader)
+            elif content_length is not None:
+                await self._read_fixed_body(reader, content_length)
+            else:
+                await self._read_until_eof(reader)
+        return {"status": status, "reason": reason, "headers": headers}
+
+    async def _read_head_block(self, reader) -> bytes:
+        """逐行读响应头直到空行；总量超过 64KiB 上限或对端提前关闭即判错。"""
+        blob = b""
+        while True:
+            try:
+                line = await reader.readline()
+            except ValueError as exc:  # 单行超过流缓冲上限
+                raise PolicyError("响应头部超过大小上限") from exc
+            if not line:
+                if blob:
+                    raise PolicyError("响应头未收齐，连接提前关闭")
+                raise PolicyError("连接已关闭，未收到任何响应数据")
+            blob += line
+            if len(blob) > self._max_bytes:
                 raise PolicyError("响应头部超过大小上限")
-        text = header_blob.decode("iso-8859-1")
+            if line in (b"\r\n", b"\n"):
+                return blob
+
+    def _parse_head(
+        self, blob: bytes
+    ) -> tuple[int, str, dict[str, str], int | None, bool, bool]:
+        """解析状态行与响应头。
+
+        返回 (status, reason, headers, content_length, chunked, has_transfer_encoding)。
+        多个 Content-Length 值不一致、或值非十进制数字，直接判错。
+        """
+        text = blob.decode("iso-8859-1")
         lines = text.split("\r\n")
         status_line = lines[0]
         if not status_line.startswith("HTTP/"):
@@ -272,18 +331,112 @@ class Prober:
         except (IndexError, ValueError) as exc:
             raise PolicyError(f"无法解析状态行: {status_line[:80]!r}") from exc
         headers: dict[str, str] = {}
+        lengths: list[int] = []
+        chunked = False
+        has_te = False
         for line in lines[1:]:
             if not line or ":" not in line:
                 continue
             key, value = line.split(":", 1)
-            headers[key.strip().lower()] = value.strip()
-        body_read = 0
-        while body_read < self._max_bytes:
+            key = key.strip().lower()
+            value = value.strip()
+            headers[key] = value
+            if key == "content-length":
+                # 允许 "Content-Length: 42, 42" 这类等值重复，值不一致即冲突
+                for part in value.split(","):
+                    part = part.strip()
+                    if not part.isdigit():
+                        raise PolicyError(f"非法 Content-Length 值: {part!r}")
+                    if lengths and int(part) != lengths[0]:
+                        raise PolicyError(
+                            "响应长度信息冲突: 多个 Content-Length 值不一致 "
+                            f"({lengths[0]} != {part})"
+                        )
+                    lengths.append(int(part))
+            elif key == "transfer-encoding":
+                has_te = True
+                # 仅最终编码为 chunked 时按分块界定；否则按连接关闭界定
+                encodings = [e.strip().lower() for e in value.split(",")]
+                chunked = bool(encodings) and encodings[-1] == "chunked"
+        content_length = lengths[0] if lengths else None
+        return status, reason, headers, content_length, chunked, has_te
+
+    async def _read_fixed_body(self, reader, declared: int) -> None:
+        """按 Content-Length 收齐正文；提前断开即“正文不完整”。
+
+        声明长度超过 64KiB 上限时读满上限即停（自我保护性截断，
+        连通性已确认，不再消耗对端剩余数据）。
+        """
+        remaining = min(declared, self._max_bytes)
+        while remaining > 0:
+            chunk = await reader.read(min(4096, remaining))
+            if not chunk:
+                raise PolicyError(
+                    f"响应正文不完整: 声明 Content-Length {declared} 字节，"
+                    "连接在收齐前关闭"
+                )
+            remaining -= len(chunk)
+
+    async def _read_until_eof(self, reader) -> None:
+        """无长度信息时正文以连接关闭为界；最多读取 64KiB 上限。"""
+        read_total = 0
+        while read_total < self._max_bytes:
             chunk = await reader.read(4096)
             if not chunk:
-                break
-            body_read += len(chunk)
-        return {"status": status, "reason": reason, "headers": headers}
+                return
+            read_total += len(chunk)
+
+    async def _read_chunked_body(self, reader) -> None:
+        """读取分块编码正文直到终止块；格式错误或未收齐即判错。"""
+        read_total = 0
+        while True:
+            size_line = await self._read_chunk_line(reader, "块大小行")
+            try:
+                size = int(size_line.split(b";", 1)[0].strip(), 16)
+            except ValueError as exc:
+                raise PolicyError(
+                    f"分块编码格式错误: 非法块大小 {size_line[:40]!r}"
+                ) from exc
+            if size < 0:
+                raise PolicyError(
+                    f"分块编码格式错误: 非法块大小 {size_line[:40]!r}"
+                )
+            if size == 0:
+                # 终止块后读 trailer，直到空行结束
+                while True:
+                    trailer = await self._read_chunk_line(reader, "trailer 行")
+                    if not trailer.strip(b"\r\n"):
+                        return
+            remaining = size
+            while remaining > 0:
+                chunk = await reader.read(min(4096, remaining))
+                if not chunk:
+                    raise PolicyError("分块编码格式错误: 块数据未收齐连接即关闭")
+                remaining -= len(chunk)
+                read_total += len(chunk)
+                if read_total >= self._max_bytes:
+                    return  # 达到 64KiB 上限：截断保护，连通性已确认
+            crlf = await self._read_exactly(reader, 2)
+            if crlf != b"\r\n":
+                raise PolicyError("分块编码格式错误: 块数据后缺少 CRLF")
+
+    async def _read_chunk_line(self, reader, what: str) -> bytes:
+        try:
+            line = await reader.readline()
+        except ValueError as exc:
+            raise PolicyError(f"分块编码格式错误: {what}过长") from exc
+        if not line:
+            raise PolicyError(f"分块编码格式错误: 读取{what}时连接提前关闭")
+        return line
+
+    async def _read_exactly(self, reader, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = await reader.read(n - len(buf))
+            if not chunk:
+                raise PolicyError("分块编码格式错误: 连接提前关闭")
+            buf += chunk
+        return buf
 
 
 def normalize_redirect(base_url: str, location: str) -> str:

@@ -8,6 +8,7 @@
     "multi-a.demo.test":        ["172.31.10.10", "172.31.10.11"],
     "redirect-ok.demo.test":    ["172.31.10.10"],
     "redirect-final.demo.test": ["172.31.10.10"],
+    "raw.demo.test":            ["172.31.10.10"],
     "loop1.demo.test":          ["172.31.10.10"],
     "loop2.demo.test":          ["172.31.10.10"],
     "loop3.demo.test":          ["172.31.10.10"],

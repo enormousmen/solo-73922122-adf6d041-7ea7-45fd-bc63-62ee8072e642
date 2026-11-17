@@ -81,6 +81,27 @@ probe_url "IPv6 字面量：拒绝" "http://[2001:db8::1]/"
 probe_url "非 HTTP(S) scheme：拒绝" "ftp://allowed.demo.test${HPORT}/"
 probe_url "URL 携带 userinfo：拒绝" "http://u:p@allowed.demo.test${HPORT}/"
 
+# 7) HTTP/1.1 响应完整性（原始可控目标，默认端口 8090）
+RAWPORT="${RAW_PORT:-8090}"
+probe_url "保活目标：完整响应后连接保持，探测应立即完成（不等读取超时）" \
+  "http://raw.demo.test:${RAWPORT}/keepalive"
+probe_url "保活目标上的 302：响应完整即及时跟随跳转" \
+  "http://raw.demo.test:${RAWPORT}/keepalive-redirect"
+probe_url "断流目标：Content-Length 未收齐即断开，必须报错（不得报可达）" \
+  "http://raw.demo.test:${RAWPORT}/truncated"
+probe_url "分块响应：读到终止块即完成（连接保持也不等待）" \
+  "http://raw.demo.test:${RAWPORT}/chunked"
+probe_url "分块格式错误：必须报错" \
+  "http://raw.demo.test:${RAWPORT}/chunked-bad"
+probe_url "长度信息冲突（Content-Length + Transfer-Encoding）：必须报错" \
+  "http://raw.demo.test:${RAWPORT}/conflict"
+probe_url "无长度头：正文以连接关闭为界" \
+  "http://raw.demo.test:${RAWPORT}/no-length"
+probe_url "HEAD 保活目标：完整响应头即结束" \
+  "http://raw.demo.test:${RAWPORT}/keepalive" HEAD
+probe_url "204 无正文响应：完整响应头即结束" \
+  "http://raw.demo.test:${RAWPORT}/status/204"
+
 echo
 echo "### 验证禁止目标从未收到探测请求（应返回空列表）:"
 curl -sS "http://127.0.0.1:${TARGET_REQ_PORT}/_requests" \
